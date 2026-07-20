@@ -84,7 +84,14 @@ export function resolveDockerTransport(opts?: DockerConnectionOptions): DockerTr
         "Check that SSH credentials are correct, the remote Docker socket exists, the SSH server supports streamlocal forwarding, and the SSH user has permission to access the Docker socket.",
       establish: async () => {
         bridge = createDockerSshBridge(opts);
-        const { host, port } = await bridge.start();
+        const endpoint = await bridge.start();
+        if ("socketPath" in endpoint) {
+          return {
+            socketPath: endpoint.socketPath,
+            timeout: opts.timeout ?? 600_000,
+          };
+        }
+        const { host, port } = endpoint;
         return {
           protocol: "http",
           host,

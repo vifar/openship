@@ -1,5 +1,9 @@
 import net from "node:net";
 import type { Duplex } from "node:stream";
+import { spawn, type ChildProcess } from "node:child_process";
+import { access, chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import type { ClientChannel } from "ssh2";
 
@@ -273,10 +277,130 @@ export async function verifyDockerSshBridge(opts: DockerConnectionOptions): Prom
 
 /** A loopback TCP listener that tunnels Docker API traffic to the remote socket. */
 export interface DockerSshBridge {
-  /** Bind the listener and return the loopback address dockerode should target. */
-  start(): Promise<{ host: string; port: number }>;
+  /** Bind the bridge and return the Docker endpoint dockerode should target. */
+  start(): Promise<{ socketPath: string } | { host: string; port: number }>;
   /** Tear down the listener and any live connections. */
   close(): void;
+}
+
+/**
+ * `ssh2` streamlocal forwarding is not reliable on every OpenSSH/Bun
+ * combination: a channel can open but never move bytes. Use the operating
+ * system's SSH implementation when its auth model can be represented without
+ * weakening a caller-supplied host verifier. The ssh2 bridge remains the
+ * fallback for password auth and custom verifier configurations.
+ */
+export function shouldUseNativeSshBridge(opts: DockerConnectionOptions): boolean {
+  return Boolean(
+    opts.host &&
+      !opts.hostVerifier &&
+      !opts.password &&
+      (opts.privateKey || opts.sshAgent),
+  );
+}
+
+export function buildNativeSshBridgeCommand(
+  opts: DockerConnectionOptions,
+  localSocketPath: string,
+  remoteSocketPath: string,
+  privateKeyPath?: string,
+): { command: string; args: string[] } {
+  const args = [
+    "-N",
+    "-o", "BatchMode=yes",
+    "-o", "ExitOnForwardFailure=yes",
+    // The existing ssh2 transport also accepts an unpinned host when callers
+    // did not provide hostVerifier. Preserve that contract here; callers that
+    // require pinning stay on the ssh2 path above.
+    "-o", "StrictHostKeyChecking=no",
+    "-o", "UserKnownHostsFile=/dev/null",
+    "-p", String(opts.port ?? 22),
+  ];
+  if (privateKeyPath) args.push("-i", privateKeyPath);
+  args.push(
+    "-L", `${localSocketPath}:${remoteSocketPath}`,
+    `${opts.username ?? "root"}@${opts.host}`,
+  );
+  return { command: "ssh", args };
+}
+
+function createNativeDockerSshBridge(opts: DockerConnectionOptions): DockerSshBridge {
+  let child: ChildProcess | null = null;
+  let bridgeDir: string | null = null;
+
+  const cleanup = () => {
+    child?.kill();
+    child = null;
+    if (bridgeDir) {
+      void rm(bridgeDir, { recursive: true, force: true });
+      bridgeDir = null;
+    }
+  };
+
+  return {
+    start: async () => {
+      if (child && bridgeDir) return { socketPath: join(bridgeDir, "docker.sock") };
+
+      bridgeDir = await mkdtemp(join(tmpdir(), "openship-docker-ssh-"));
+      const socketPath = join(bridgeDir, "docker.sock");
+      let keyPath: string | undefined;
+      if (opts.privateKey) {
+        keyPath = join(bridgeDir, "identity");
+        await writeFile(keyPath, opts.privateKey, { mode: 0o600 });
+        await chmod(keyPath, 0o600);
+      }
+
+      const { command, args } = buildNativeSshBridgeCommand(
+        opts,
+        socketPath,
+        await resolveRemoteDockerSocketPath(opts),
+        keyPath,
+      );
+      child = spawn(command, args, {
+        stdio: ["ignore", "ignore", "pipe"],
+        env: opts.sshAgent ? { ...process.env, SSH_AUTH_SOCK: opts.sshAgent } : process.env,
+      });
+
+      let stderr = "";
+      child.stderr?.on("data", (chunk: Buffer) => {
+        stderr += chunk.toString("utf8");
+      });
+
+      try {
+        await new Promise<void>((resolve, reject) => {
+          const timer = setTimeout(
+            () => reject(new Error(`Native SSH Docker bridge timed out starting: ${stderr.trim() || "no diagnostic"}`)),
+            10_000,
+          );
+          const poll = setInterval(() => {
+            access(socketPath)
+              .then(() => {
+                clearTimeout(timer);
+                clearInterval(poll);
+                resolve();
+              })
+              .catch(() => {});
+          }, 50);
+          child!.once("error", (error) => {
+            clearTimeout(timer);
+            clearInterval(poll);
+            reject(error);
+          });
+          child!.once("exit", (code) => {
+            clearTimeout(timer);
+            clearInterval(poll);
+            reject(new Error(`Native SSH Docker bridge exited with code ${code}: ${stderr.trim() || "no diagnostic"}`));
+          });
+        });
+      } catch (error) {
+        cleanup();
+        throw error;
+      }
+
+      return { socketPath };
+    },
+    close: cleanup,
+  };
 }
 
 /**
@@ -316,6 +440,10 @@ async function openDockerUpstream(opts: DockerConnectionOptions): Promise<Duplex
  * loopback bridge is honored identically by Node and Bun.
  */
 export function createDockerSshBridge(opts: DockerConnectionOptions): DockerSshBridge {
+  if (shouldUseNativeSshBridge(opts)) {
+    return createNativeDockerSshBridge(opts);
+  }
+
   const clients = new Set<net.Socket>();
 
   const server = net.createServer((client) => {
